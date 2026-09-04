@@ -56,7 +56,50 @@ Rule of thumb emerging from the 2026 vendor landscape: **hardware-coupled, physi
 
 ---
 
-## 2. AI capability map, mapped to your roadmap
+## 2. Multi-tenancy — concrete decisions needed now
+
+**This product is built to be sold to multiple manufacturers, not run for a single plant.** Pune Plant / Building 2 is a reference/pilot case, not the customer. That status is confirmed, not aspirational — the decisions below stop being deferrable the moment a second tenant's data touches the schema, so they belong in Phase 1, not Phase 2.
+
+### 2.1 Tenant isolation strategy
+
+| Approach | Pros | Cons | Fit |
+|---|---|---|---|
+| **Schema-per-tenant** (separate Postgres schema per customer) | Strong isolation, easy per-tenant backup/restore/export, simple to reason about for compliance-sensitive manufacturing customers | Migration fan-out (one schema change × N tenants), connection pooling gets harder at scale | Better for **early-stage, few large enterprise customers** where isolation and per-customer data export matter more than horizontal scale |
+| **Shared schema + Row-Level Security (RLS)** with a `tenant_id` on every table | Single schema to migrate, scales to many small/mid customers cheaply, standard Postgres feature (no app-layer trust required) | Requires rigorous discipline — every query, every index, every new table must carry `tenant_id` from day one; a missed RLS policy is a data leak | Better for **many small-to-mid manufacturers** (the more likely SaaS shape at scale) |
+
+**Recommendation:** start with **RLS + shared schema**, because retrofitting tenant isolation into an already-built single-tenant schema is far more expensive than building it in from Phase 1. Enforce `tenant_id` at the Postgres RLS policy level (not just in application code) so a bug in the API layer can't leak cross-tenant data — this matters especially once the AI/Agent layer starts running queries on customers' behalf.
+
+**Action for Phase 1:** every table in the current schema design — Work Orders, Equipment, Lines, Alerts, Genealogy — needs a `tenant_id` column and an RLS policy before any real customer data goes in, even the pilot.
+
+### 2.2 Plant/site configurability
+
+The current Figma screens and any generated prototypes assume **one fixed plant shape**: 6 lines (Assembly/Welding/Assembly/Paint/Packaging/Inspection), Pune's specific layout. A real tenant might have 2 lines or 40, different line names, different ISA-95 area/line hierarchies, and different KPI targets (a food & beverage plant's quality specs look nothing like an automotive stamping plant's).
+
+What needs to become tenant-configurable rather than hardcoded:
+- Number of lines/areas/equipment (ISA-95 Site → Area → Line → Equipment hierarchy, per tenant)
+- Line names, shift patterns, and shift labels ("Shift A · 06:00–14:00" is Pune's convention, not universal)
+- KPI/OEE target thresholds (what counts as "Warning" vs "Critical" varies by industry and by customer)
+- Quality spec definitions (SPC control limits, defect taxonomies)
+
+**Implication for the Data Backbone (Section 1):** the ISA-95 object model needs a tenant-scoped configuration layer sitting above the raw schema — think of it as "tenant settings" that parameterize how the same UI renders for a 3-line plant vs. a 40-line plant, rather than baking Pune's shape into the tables or the screens.
+
+### 2.3 Onboarding / setup flow
+
+A single-tenant internal tool can be configured by an engineer running SQL. A SaaS product needs a **self-serve (or at least sales-assisted) setup flow**: a new tenant admin defines their plant hierarchy, lines, shifts, and initial users without your team touching a database. This doesn't need to exist for the pilot, but the schema and API decisions in Phase 1 should not assume a human will always configure new tenants by hand — that assumption gets expensive to unwind later.
+
+**Design implication:** the Figma file has no admin/tenant-settings screens yet (flagged in the design handoff as "not started"). This is no longer a nice-to-have — plant configuration, user management, and (eventually) billing are core product surface for a multi-tenant SaaS, not an afterthought screen.
+
+### 2.4 Billing / plan tiers
+
+The 4-phase roadmap (Core MES → Embedded Analytics → Predictive ML → Prescriptive/Agentic) is a natural candidate for plan-tier packaging — e.g. Core MES as the base plan, Predictive ML and the LLM copilot as premium add-ons. Worth deciding *roughly* which phase maps to which tier before Phase 3 work starts, since it affects whether predictive/agentic features are built as tenant-wide capabilities or per-seat/per-tenant toggleable features from the start.
+
+### 2.5 Cross-tenant AI/ML data isolation
+
+This is easy to miss and expensive to get wrong: once Phase 3 (Predictive ML) and Phase 4 (LLM copilot) exist, **training data and RAG context must stay tenant-scoped**. A predictive maintenance model trained on aggregate data must not leak one tenant's failure patterns into another's inference, and the copilot's RAG layer (pgvector) must filter by `tenant_id` on every retrieval — the same discipline as the RLS policies in 2.1, applied to the AI layer specifically.
+
+---
+
+## 3. AI capability map, mapped to your roadmap
 
 ### Phase 1 — Core MES (current)
 No AI yet — but design the schema so AI can read it later:
@@ -85,7 +128,7 @@ Landscape as of 2026:
 
 ---
 
-## 3. Concrete tool/stack recommendations for building this yourself
+## 4. Concrete tool/stack recommendations for building this yourself
 
 **LLM/copilot layer**
 - Anthropic API (Claude) with tool-calling/MCP for the copilot to query your own MES endpoints — same MCP pattern you're already using for Figma, applied to your production API
@@ -110,18 +153,19 @@ Landscape as of 2026:
 
 ---
 
-## 4. Suggested build sequence (concrete next steps)
+## 5. Suggested build sequence (concrete next steps)
 
-1. **Finish Phase 1 UI gaps** (empty/error states, drill-downs, settings — already identified in the design handoff)
-2. **Nail the data backbone** — this is the unglamorous but non-negotiable prerequisite for everything in Phase 3-4
+0. **Decide the tenant isolation strategy (Section 2.1) before finalizing the Phase 1 schema** — this is now the first architectural decision, ahead of any UI or AI work, because every table and every screen downstream inherits it
+1. **Finish Phase 1 UI gaps** (empty/error states, drill-downs — already built; settings/admin/tenant-config screens — not yet started, and now core scope per Section 2.3, not optional polish)
+2. **Nail the data backbone** — this is the unglamorous but non-negotiable prerequisite for everything in Phase 3-4, and it now includes tenant-scoping (`tenant_id` + RLS) as part of "getting it right," not a separate later task
 3. **Ship Phase 2 analytics** using data you already have (no AI dependency, proves the pipeline)
-4. **Build the LLM copilot early, even in a narrow form** — e.g. "ask about any work order's status" — because it's your best AI differentiation and doesn't require ML training data to start delivering value
-5. **Add anomaly-based predictive maintenance** once you have months of real customer time-series data
+4. **Build the LLM copilot early, even in a narrow form** — e.g. "ask about any work order's status" — because it's your best AI differentiation and doesn't require ML training data to start delivering value; scope its RAG retrieval to be tenant-filtered from the first version (Section 2.5)
+5. **Add anomaly-based predictive maintenance** once you have months of real customer time-series data, keeping per-tenant model isolation in mind from the start
 6. **Layer in computer vision and advanced scheduling** last — they're the most build-intensive and benefit most from having paying customers' real data to tune against
 
 ---
 
-## 5. Sources consulted (Sept 2026 landscape)
+## 6. Sources consulted (Sept 2026 landscape)
 - Predictive maintenance platform comparisons: f7i.ai, Monitory, phosailabs
 - Computer vision inspection landscape: iFactory, Overview.ai, ifactoryapp
 - AI/APS scheduling: Fabrico, Phantasma, phosailabs
